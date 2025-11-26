@@ -1,13 +1,11 @@
 from pox.core import core
 from pox.lib.packet.ipv4 import ipv4
-from pox.lib.packet.ethernet import ethernet
 
 log = core.getLogger("firewall")
 
 class Firewall:
     def __init__(self):
-        # Rule format: (direction, protocol, port, action)
-        # Direction implies ingress/egress checking logic if needed
+        # Rule format: (Protocol, Port, Action)
         self.rules = [
             ("TCP", 22, "DENY"),   # Block SSH
             ("TCP", 80, "DENY"),   # Block HTTP
@@ -34,7 +32,10 @@ class Firewall:
         # Extract destination port
         # Helper to get transport layer payload
         transport_pkt = ip_pkt.payload
-        dst_port = transport_pkt.dstport
+        try:
+            dst_port = transport_pkt.dstport
+        except AttributeError:
+            return True # Not a transport packet
 
         # Check against rules (Priority: DENY > ALLOW)
         for rule_proto, rule_port, rule_action in self.rules:

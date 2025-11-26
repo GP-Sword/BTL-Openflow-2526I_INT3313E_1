@@ -16,23 +16,33 @@ class ARPHandler:
             '10.0.3.1': EthAddr('00:00:00:00:03:01')
         }
 
-    def handle_arp_packet(self, packet, packet_in, connection):
+    def handle_arp_packet(self, packet, in_port, connection):
+        """
+        Handles ARP logic.
+        Args:
+            packet: Parsed ethernet packet.
+            in_port: Input port number.
+            connection: OpenFlow connection object.
+        """
         arp_pkt = packet.payload
         src_ip = str(arp_pkt.protosrc)
         src_mac = arp_pkt.hwsrc
 
-        # Update cache
+        # 1. Update ARP Cache
         self.arp_cache[src_ip] = src_mac
         
-        # Check if it is a request for one of our gateways
+        # 2. Check if request is for Gateway
+        # We only need to reply if they are asking for the Router's IP
         dst_ip = str(arp_pkt.protodst)
         if dst_ip in self.router_macs:
             if arp_pkt.opcode == arp.REQUEST:
-                self.send_arp_reply(packet, connection, self.router_macs[dst_ip])
-                return True # Handled
+                # We have all info needed, no need for packet_in object
+                self.send_arp_reply(packet, connection, self.router_macs[dst_ip], in_port)
+                return True # Handled by Router
         return False
 
-    def send_arp_reply(self, request_pkt, connection, router_mac):
+    def send_arp_reply(self, request_pkt, connection, router_mac, out_port):
+        """Constructs and sends an ARP Reply."""
         arp_req = request_pkt.payload
         arp_rep = arp()
         arp_rep.opcode = arp.REPLY
@@ -46,8 +56,7 @@ class ARPHandler:
         
         msg = of.ofp_packet_out()
         msg.data = eth.pack()
-        msg.actions.append(of.ofp_action_output(port=of.OFPP_IN_PORT))
-        msg.in_port = connection.ports[of.OFPP_NONE] # Virtual source
+        msg.actions.append(of.ofp_action_output(port=out_port))
         connection.send(msg)
         log.debug("Sent ARP Reply: %s is at %s", arp_rep.protosrc, router_mac)
 
