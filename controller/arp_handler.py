@@ -3,21 +3,26 @@ from pox.lib.packet.ethernet import ethernet
 from pox.lib.packet.arp import arp
 from pox.lib.addresses import IPAddr, EthAddr
 import pox.openflow.libopenflow_01 as of
+import time
 
 log = core.getLogger("arp_handler")
 
 class ARPHandler:
     def __init__(self, arp_cache, ip_port_map, mac_to_port):
-        self.arp_cache = arp_cache         # Reference to shared ARP cache
-        self.ip_port_map = ip_port_map     # Reference to shared IP Location map
-        self.mac_to_port = mac_to_port     # Reference to shared L2 table
+        self.arp_cache = arp_cache
+        self.ip_port_map = ip_port_map
+        self.mac_to_port = mac_to_port
         
-        # Virtual Gateway MACs
         self.router_macs = {
             '10.0.1.1': EthAddr('02:00:00:00:01:01'),
             '10.0.2.1': EthAddr('02:00:00:00:02:01'),
-            '10.0.3.1': EthAddr('02:00:00:00:03:01') # Added support for s3
+            '10.0.3.1': EthAddr('02:00:00:00:03:01')
         }
+        
+        # Anti-Loop: Track recently flooded ARP requests
+        # Key: (src_mac, target_ip), Value: timestamp
+        self.arp_flood_history = {}
+        self.flood_suppress_sec = 2.0
 
     def handle_arp_packet(self, packet, event):
         arp_pkt = packet.payload
@@ -26,36 +31,46 @@ class ARPHandler:
         dpid = event.dpid
         in_port = event.port
 
-        # 1. Learn Mapping (IP -> MAC) and (IP -> Location)
+        # 1. Update State
         self.arp_cache[src_ip] = src_mac
-        if self.ip_port_map.get(src_ip) != (dpid, in_port):
-            self.ip_port_map[src_ip] = (dpid, in_port)
-            log.debug("ARP: Learned %s is at %s (connected to dpid %s port %s)", 
-                      src_ip, src_mac, dpid, in_port)
+        # Note: We rely on Controller's Sticky Learning for Port Map stability
+        if self.ip_port_map.get(src_ip) is None:
+             self.ip_port_map[src_ip] = (dpid, in_port)
 
         # 2. Handle ARP Request
         if arp_pkt.opcode == arp.REQUEST:
             dst_ip = str(arp_pkt.protodst)
             
-            # A. Request for Gateway (e.g., h1 asking for 10.0.1.1)
+            # A. Gateway Request
             if dst_ip in self.router_macs:
                 self.send_arp_reply(packet, event, self.router_macs[dst_ip])
                 return
 
-            # B. Request for another Host (e.g., h1 asking for h2)
-            # Proxy ARP: If Controller knows destination MAC, reply immediately (reduces flood)
+            # B. Host Request (Proxy ARP)
             if dst_ip in self.arp_cache:
                 dst_mac = self.arp_cache[dst_ip]
                 self.send_arp_reply(packet, event, dst_mac)
             else:
-                # Unknown -> Flood ARP Request to network to find host
-                # Flood using packet-out, DO NOT install flow
+                # C. Unknown Host -> Flood with Deduplication
+                # Check if we already flooded this request recently
+                flood_key = (src_mac, dst_ip)
+                current_time = time.time()
+                
+                last_time = self.arp_flood_history.get(flood_key, 0)
+                if current_time - last_time < self.flood_suppress_sec:
+                    # We saw this request recently. It's likely a loop echo. DROP IT.
+                    # log.debug("ARP: Suppressed loop flood for %s -> %s", src_mac, dst_ip)
+                    return
+                
+                # Update timestamp and flood ONCE
+                self.arp_flood_history[flood_key] = current_time
+                
                 msg = of.ofp_packet_out(data=event.ofp.data)
                 msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
                 event.connection.send(msg)
 
     def send_arp_reply(self, request_packet, event, src_mac):
-        """Send unicast ARP Reply to the requester"""
+        """Send unicast ARP Reply"""
         arp_req = request_packet.payload
         arp_rep = arp()
         arp_rep.opcode = arp.REPLY
@@ -71,14 +86,20 @@ class ARPHandler:
         msg.data = eth.pack()
         msg.actions.append(of.ofp_action_output(port=event.port))
         event.connection.send(msg)
-        # log.debug("Sent ARP Reply: %s is at %s", arp_req.protodst, src_mac)
 
     def send_arp_request_from_controller(self, target_ip, event):
         """
-        Controller actively sends ARP Request to find destination Host MAC.
-        Used when IP packet needs routing but destination MAC is missing.
+        Controller initiated ARP Request.
         """
-        # Determine Gateway IP for that subnet to spoof sender
+        # Deduplication for controller-generated ARPs as well
+        # Use a dummy MAC for key or just target_ip
+        flood_key = (EthAddr("00:00:00:00:00:00"), target_ip)
+        current_time = time.time()
+        if current_time - self.arp_flood_history.get(flood_key, 0) < self.flood_suppress_sec:
+            return
+
+        self.arp_flood_history[flood_key] = current_time
+
         src_gw_ip = '10.0.1.1'
         if target_ip.startswith('10.0.2'): src_gw_ip = '10.0.2.1'
         elif target_ip.startswith('10.0.3'): src_gw_ip = '10.0.3.1'
@@ -95,7 +116,6 @@ class ARPHandler:
         eth = ethernet(type=ethernet.ARP_TYPE, src=router_mac, dst=r.hwdst)
         eth.payload = r
         
-        # Flood to all switches to find host (since location is unknown)
         msg = of.ofp_packet_out(data=eth.pack())
         msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
         

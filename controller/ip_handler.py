@@ -8,15 +8,12 @@ import pox.openflow.libopenflow_01 as of
 log = core.getLogger("ip_handler")
 
 class IPHandler:
-    def __init__(self, arp_cache, ip_port_map, mac_to_port, flow_installer, firewall, arp_handler):
-        self.arp_cache = arp_cache
-        self.ip_port_map = ip_port_map
-        self.mac_to_port = mac_to_port
+    def __init__(self, arp_handler, flow_installer, firewall):
+        self.arp = arp_handler
         self.flows = flow_installer
         self.fw = firewall
-        self.arp_h = arp_handler
-        
-        self.packet_waiting = {} # {dst_ip: [event, ...]}
+        # Queue only for waiting for ARP resolution (MAC Address)
+        self.waiting_packets = {} 
 
     def get_gateway(self, ip_str):
         if ip_str.startswith("10.0.1"): return '10.0.1.1'
@@ -27,15 +24,14 @@ class IPHandler:
     def handle_ip_packet(self, event):
         packet = event.parsed
         ip_pkt = packet.payload
-        dst_ip = str(ip_pkt.dstip)
         src_ip = str(ip_pkt.srcip)
-        
+        dst_ip = str(ip_pkt.dstip)
         
         # 1. Packet to Router (Ping Gateway)
-        if dst_ip in self.arp_h.router_macs:
+        if dst_ip in self.arp.router_macs:
             if ip_pkt.protocol == ipv4.ICMP_PROTOCOL and ip_pkt.payload.type == 8: # Echo Req
                 self.send_icmp_reply(event, ip_pkt)
-            return True # Handled by L3
+            return True 
             
         src_gw = self.get_gateway(src_ip)
         dst_gw = self.get_gateway(dst_ip)
@@ -46,74 +42,80 @@ class IPHandler:
             return False 
 
         # 3. Inter-subnet Routing (L3)
-        # Check if we have MAC and Port info for destination
-        if dst_ip in self.arp_cache and dst_ip in self.ip_port_map:
+        # If we know the Destination MAC and Location
+        if dst_ip in self.arp.arp_cache and dst_ip in self.arp.ip_port_map:
             self.forward_l3_packet(event, dst_ip, dst_gw)
         else:
-            # Unknown info -> Queue packet and send ARP Request
-            log.info("L3: Unknown MAC/Port for %s. Queueing and ARPing.", dst_ip)
-            if dst_ip not in self.packet_waiting:
-                self.packet_waiting[dst_ip] = []
-                self.arp_h.send_arp_request_from_controller(dst_ip, event)
-            self.packet_waiting[dst_ip].append(event)
+            # Unknown Info -> Queue packet and send ARP Request to find it
+            # We must queue here because we can't construct the packet without Dest MAC
+            if dst_ip not in self.waiting_packets:
+                self.waiting_packets[dst_ip] = []
+                self.arp.send_arp_request_from_controller(dst_ip, event)
+            self.waiting_packets[dst_ip].append(event)
             
         return True
 
     def forward_l3_packet(self, event, dst_ip, dst_gw_ip):
         """
-        Execute Routing logic: Rewrite MAC + Forward + Install Flow
+        Execute Routing logic using 'Teleportation' (Direct Egress Injection).
+        This guarantees delivery even if L2 paths are not fully converged.
         """
-        dst_mac = self.arp_cache[dst_ip]
-        # Get router MAC of DESTINATION subnet to use as new source MAC
-        src_mac_gateway = self.arp_h.router_macs[dst_gw_ip]
+        dst_mac = self.arp.arp_cache[dst_ip]
+        src_mac_gateway = self.arp.router_macs[dst_gw_ip]
         
-        # Find egress switch and port of destination host
-        egress_dpid, egress_port = self.ip_port_map[dst_ip]
+        # Get Destination Switch and Port (Where the host is connected)
+        egress_dpid, egress_port = self.arp.ip_port_map[dst_ip]
         
-        # Find output port on CURRENT Switch (Ingress Switch) to reach destination
-        # This is critical logic for Ring/Mesh Topology
-        ingress_dpid = event.dpid
-        out_port_on_ingress = None
-        
-        if ingress_dpid == egress_dpid:
-            # Destination host is on this switch
-            out_port_on_ingress = egress_port
-        else:
-            # Destination host is on another switch
-            # Use L2 Learning table to find port to reach dest MAC
-            if dst_mac in self.mac_to_port[ingress_dpid]:
-                out_port_on_ingress = self.mac_to_port[ingress_dpid][dst_mac]
-            else:
-                log.warning("L3: Waiting for L2 path to %s on dpid %s", dst_mac, ingress_dpid)
-                return # Wait for L2 to learn path (ARP flood will help)
-
-        # Check Firewall (Proactive check for Egress)
+        # Check Firewall on the Egress Switch
         if self.fw.check_firewall(egress_dpid, event.parsed.payload) == "DENY":
             self.send_icmp_unreachable(event.parsed.payload, event.parsed, event.ofp, event)
             return
 
-        # Install L3 Flow (MAC Rewrite) on current switch
-        self.flows.install_l3_flow(event.connection, dst_ip, src_mac_gateway, dst_mac, out_port_on_ingress)
+        # --- STEP 1: SEND PACKET (Teleportation) ---
+        # Instead of sending via the current switch (event.connection),
+        # we send the packet DIRECTLY to the Egress Switch.
         
-        # Send packet out
         msg = of.ofp_packet_out(data=event.ofp.data)
         msg.actions.append(of.ofp_action_dl_addr.set_src(src_mac_gateway))
         msg.actions.append(of.ofp_action_dl_addr.set_dst(dst_mac))
-        msg.actions.append(of.ofp_action_output(port=out_port_on_ingress))
-        event.connection.send(msg)
+        msg.actions.append(of.ofp_action_output(port=egress_port))
         
-        log.info("L3: Routed %s -> %s via dpid %s port %s", 
-                 event.parsed.payload.srcip, dst_ip, ingress_dpid, out_port_on_ingress)
+        # Send to specific DPID (The magic part)
+        core.openflow.sendToDPID(egress_dpid, msg)
+        # log.debug("L3: Teleported packet to egress dpid %s port %s", egress_dpid, egress_port)
+
+        # --- STEP 2: INSTALL FLOW (Optimization) ---
+        # We try to install a flow on the INGRESS switch (where packet came in)
+        # so subsequent packets can travel hop-by-hop without Controller.
+        
+        ingress_dpid = event.dpid
+        out_port_ingress = None
+        
+        if ingress_dpid == egress_dpid:
+            # Host is local
+            out_port_ingress = egress_port
+        elif dst_mac in self.arp.mac_to_port[ingress_dpid]:
+            # Host is remote, and L2 table knows the next hop
+            out_port_ingress = self.arp.mac_to_port[ingress_dpid][dst_mac]
+        
+        if out_port_ingress:
+            # We know the path, install the flow
+            self.flows.install_l3_flow(event.connection, dst_ip, src_mac_gateway, dst_mac, out_port_ingress)
+        else:
+            # Path unknown (L2 table incomplete). 
+            # We do NOT install a flow yet. 
+            # The packet was already sent via Step 1, so no drop/buffer needed.
+            # Next packet will likely find the path ready.
+            pass
 
     def process_waiting_packets(self, ip_str):
-        """Process waiting packets after successful ARP"""
-        if ip_str in self.packet_waiting:
+        if ip_str in self.waiting_packets:
             gw = self.get_gateway(ip_str)
-            for event in self.packet_waiting[ip_str]:
-                # Check IP_PORT_MAP again as ARP Handler just updated it
-                if ip_str in self.ip_port_map:
+            for event in self.waiting_packets[ip_str]:
+                # Check mapping again
+                if ip_str in self.arp.ip_port_map:
                     self.forward_l3_packet(event, ip_str, gw)
-            del self.packet_waiting[ip_str]
+            del self.waiting_packets[ip_str]
 
     def send_icmp_reply(self, event, ip_pkt):
         icmp_req = ip_pkt.payload
@@ -126,12 +128,11 @@ class IPHandler:
         event.connection.send(msg)
 
     def send_icmp_unreachable(self, ip_pkt, eth_pkt, pkt_in, event):
-        # Create ICMP Destination Unreachable packet
         icmp_unr = icmp(type=3, code=0, payload=ip_pkt.pack()[:28])
         src_gw = self.get_gateway(str(ip_pkt.srcip))
         if not src_gw: return
         
-        gw_mac = self.arp_h.router_macs[src_gw]
+        gw_mac = self.arp.router_macs[src_gw]
         
         ip_rpl = ipv4(protocol=ipv4.ICMP_PROTOCOL, srcip=IPAddr(src_gw), dstip=ip_pkt.srcip, payload=icmp_unr)
         eth_rpl = ethernet(type=ethernet.IP_TYPE, src=gw_mac, dst=eth_pkt.src, payload=ip_rpl)
