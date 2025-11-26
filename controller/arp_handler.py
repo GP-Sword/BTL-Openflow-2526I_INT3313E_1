@@ -7,81 +7,56 @@ import pox.openflow.libopenflow_01 as of
 log = core.getLogger("arp_handler")
 
 class ARPHandler:
-    def __init__(self):
-        self.arp_cache = {} # IP -> MAC
+    def __init__(self, arp_cache, ip_port_map, mac_to_port):
+        self.arp_cache = arp_cache         # Reference to shared ARP cache
+        self.ip_port_map = ip_port_map     # Reference to shared IP Location map
+        self.mac_to_port = mac_to_port     # Reference to shared L2 table
+        
+        # Virtual Gateway MACs
         self.router_macs = {
-            '10.0.1.1': EthAddr('00:00:00:00:01:01'),
-            '10.0.2.1': EthAddr('00:00:00:00:02:01'),
-            '10.0.3.1': EthAddr('00:00:00:00:03:01')
+            '10.0.1.1': EthAddr('02:00:00:00:01:01'),
+            '10.0.2.1': EthAddr('02:00:00:00:02:01'),
+            '10.0.3.1': EthAddr('02:00:00:00:03:01') # Added support for s3
         }
 
-    def handle_arp_packet(self, packet, in_port, connection, mac_to_port):
-        """
-        Handles ALL ARP packets.
-        Implements Proxy ARP to prevent flooding loops.
-        """
+    def handle_arp_packet(self, packet, event):
         arp_pkt = packet.payload
         src_ip = str(arp_pkt.protosrc)
         src_mac = arp_pkt.hwsrc
+        dpid = event.dpid
+        in_port = event.port
 
-        # 1. Update ARP Cache & Learning
+        # 1. Learn Mapping (IP -> MAC) and (IP -> Location)
         self.arp_cache[src_ip] = src_mac
-        
-        # 2. Handle ARP Reply
-        if arp_pkt.opcode == arp.REPLY:
-            # We forward the reply back to the destination (the original requester)
-            # using Unicast to avoid flooding loops.
-            self._forward_arp_unicast(packet, arp_pkt.hwdst, connection, mac_to_port)
-            return True
+        if self.ip_port_map.get(src_ip) != (dpid, in_port):
+            self.ip_port_map[src_ip] = (dpid, in_port)
+            log.debug("ARP: Learned %s is at %s (connected to dpid %s port %s)", 
+                      src_ip, src_mac, dpid, in_port)
 
-        # 3. Handle ARP Request
+        # 2. Handle ARP Request
         if arp_pkt.opcode == arp.REQUEST:
             dst_ip = str(arp_pkt.protodst)
             
-            # Case A: Request for Router Gateway
+            # A. Request for Gateway (e.g., h1 asking for 10.0.1.1)
             if dst_ip in self.router_macs:
-                self.send_arp_reply(packet, connection, self.router_macs[dst_ip], in_port)
-                return True
+                self.send_arp_reply(packet, event, self.router_macs[dst_ip])
+                return
 
-            # Case B: Request for Host
+            # B. Request for another Host (e.g., h1 asking for h2)
+            # Proxy ARP: If Controller knows destination MAC, reply immediately (reduces flood)
             if dst_ip in self.arp_cache:
-                # Proxy ARP: We know the answer, reply immediately
                 dst_mac = self.arp_cache[dst_ip]
-                self.send_arp_reply(packet, connection, dst_mac, in_port)
+                self.send_arp_reply(packet, event, dst_mac)
             else:
-                # We don't know. Flood a probe to find it.
-                # Only Controller floods. Host packet is dropped/consumed.
-                self._flood_arp_request_from_controller(dst_ip)
-            
-            return True
+                # Unknown -> Flood ARP Request to network to find host
+                # Flood using packet-out, DO NOT install flow
+                msg = of.ofp_packet_out(data=event.ofp.data)
+                msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
+                event.connection.send(msg)
 
-    def _forward_arp_unicast(self, packet, dst_mac, connection, mac_to_port):
-        """Forward an ARP packet to a known MAC (Unicast) using Global L2 Table."""
-        # Find the switch and port where the destination MAC resides
-        target_dpid = None
-        target_port = None
-        
-        # Search global table
-        for dpid, table in mac_to_port.items():
-            if dst_mac in table:
-                target_dpid = dpid
-                target_port = table[dst_mac]
-                break
-        
-        if target_dpid and target_port:
-            # Send Unicast PacketOut directly to that switch
-            msg = of.ofp_packet_out(data=packet.pack())
-            msg.actions.append(of.ofp_action_output(port=target_port))
-            core.openflow.sendToDPID(target_dpid, msg)
-            log.debug("Unicast ARP Reply forwarded to %s on Switch %s Port %s", dst_mac, target_dpid, target_port)
-        else:
-            # If we don't know where the requester is, we can't forward safely in a loop topology.
-            # We drop it. The requester will retry later (and by then we might have learned their location).
-            pass
-
-    def send_arp_reply(self, request_pkt, connection, src_mac, out_port):
-        """Constructs and sends an ARP Reply."""
-        arp_req = request_pkt.payload
+    def send_arp_reply(self, request_packet, event, src_mac):
+        """Send unicast ARP Reply to the requester"""
+        arp_req = request_packet.payload
         arp_rep = arp()
         arp_rep.opcode = arp.REPLY
         arp_rep.hwdst = arp_req.hwsrc
@@ -89,18 +64,26 @@ class ARPHandler:
         arp_rep.protodst = arp_req.protosrc
         arp_rep.hwsrc = src_mac
         
-        eth = ethernet(type=ethernet.ARP_TYPE, src=src_mac, dst=arp_req.hwsrc)
+        eth = ethernet(type=ethernet.ARP_TYPE, src=src_mac, dst=request_packet.src)
         eth.payload = arp_rep
         
         msg = of.ofp_packet_out()
         msg.data = eth.pack()
-        msg.actions.append(of.ofp_action_output(port=out_port))
-        connection.send(msg)
+        msg.actions.append(of.ofp_action_output(port=event.port))
+        event.connection.send(msg)
+        # log.debug("Sent ARP Reply: %s is at %s", arp_req.protodst, src_mac)
 
-    def send_arp_request(self, connection, target_ip, src_gw_ip):
-        """Send specific ARP request on a connection."""
-        router_mac = self.router_macs.get(src_gw_ip)
-        if not router_mac: return
+    def send_arp_request_from_controller(self, target_ip, event):
+        """
+        Controller actively sends ARP Request to find destination Host MAC.
+        Used when IP packet needs routing but destination MAC is missing.
+        """
+        # Determine Gateway IP for that subnet to spoof sender
+        src_gw_ip = '10.0.1.1'
+        if target_ip.startswith('10.0.2'): src_gw_ip = '10.0.2.1'
+        elif target_ip.startswith('10.0.3'): src_gw_ip = '10.0.3.1'
+        
+        router_mac = self.router_macs[src_gw_ip]
 
         r = arp()
         r.opcode = arp.REQUEST
@@ -112,16 +95,10 @@ class ARPHandler:
         eth = ethernet(type=ethernet.ARP_TYPE, src=router_mac, dst=r.hwdst)
         eth.payload = r
         
-        msg = of.ofp_packet_out()
-        msg.data = eth.pack()
+        # Flood to all switches to find host (since location is unknown)
+        msg = of.ofp_packet_out(data=eth.pack())
         msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
-        connection.send(msg)
-
-    def _flood_arp_request_from_controller(self, target_ip):
-        """Controller sends ARP Request to ALL switches."""
-        src_gw = '10.0.1.1'
-        if target_ip.startswith('10.0.2'): src_gw = '10.0.2.1'
-        elif target_ip.startswith('10.0.3'): src_gw = '10.0.3.1'
-
+        
         for connection in core.openflow.connections:
-            self.send_arp_request(connection, target_ip, src_gw)
+            connection.send(msg)
+        log.info("L3: Sent ARP Request for %s from Controller", target_ip)
