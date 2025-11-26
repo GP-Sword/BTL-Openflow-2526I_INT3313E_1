@@ -4,7 +4,6 @@ from pox.lib.packet.arp import arp
 from pox.lib.recoco import Timer
 import pox.openflow.libopenflow_01 as of
 import pox.openflow.discovery
-import pox.openflow.spanning_tree
 
 from arp_handler import ARPHandler
 from ip_handler import IPHandler
@@ -38,17 +37,17 @@ class SDNController(object):
         self.mac_to_port.setdefault(dpid, {})
         if packet.src not in self.mac_to_port[dpid]:
             self.mac_to_port[dpid][packet.src] = in_port
-            # log.debug("Learned %s on dpid %s port %s", packet.src, dpid, in_port)
+            log.debug("Learned %s on dpid %s port %s", packet.src, dpid, in_port)
 
         # 2. Dispatch
         if packet.type == ethernet.ARP_TYPE:
-            handled = self.arp_handler.handle_arp_packet(packet, in_port, event.connection)
-            if handled:
-                if packet.payload.opcode == arp.REPLY:
-                    src_ip = str(packet.payload.protosrc)
-                    self.ip_handler.process_waiting_packets(src_ip, packet.src, self.mac_to_port)
-            else:
-                self._handle_l2_switching(event)
+            # Pass mac_to_port to ARP Handler so it can do Unicast Forwarding
+            self.arp_handler.handle_arp_packet(packet, in_port, event.connection, self.mac_to_port)
+            
+            # If it was an ARP Reply, we might need to flush waiting L3 packets
+            if packet.payload.opcode == arp.REPLY:
+                src_ip = str(packet.payload.protosrc)
+                self.ip_handler.process_waiting_packets(src_ip, packet.src, self.mac_to_port)
 
         elif packet.type == ethernet.IP_TYPE:
             # Try L3 Routing first
@@ -62,14 +61,19 @@ class SDNController(object):
             self._handle_l2_switching(event)
 
     def _handle_l2_switching(self, event):
+        """
+        Modified L2 Switching for Loop Protection (No STP).
+        Policy: KNOWN UNICAST ONLY. Drop everything else.
+        """
         packet = event.parsed
         dpid = event.dpid
         dst_mac = packet.dst
         
+        # Case A: Multicast/Broadcast
         if dst_mac.is_multicast:
-            self._flood_packet(event)
-            return
+            return 
 
+        # Case B: Unicast
         if dst_mac in self.mac_to_port[dpid]:
             out_port = self.mac_to_port[dpid][dst_mac]
             self.flow_installer.install_l2_flow(event.connection, dst_mac, out_port)
@@ -78,24 +82,16 @@ class SDNController(object):
             msg.actions.append(of.ofp_action_output(port=out_port))
             event.connection.send(msg)
         else:
-            self._flood_packet(event)
+            pass
 
     def _handle_FlowStatsReceived(self, event):
         self.monitor.handle_flow_stats(event)
 
     def _timer_func(self):
-        # Request stats from all connected switches
         for connection in core.openflow.connections:
             connection.send(of.ofp_stats_request(body=of.ofp_flow_stats_request()))
 
-    def _flood_packet(self, event):
-        """Standard L2 flooding."""
-        msg = of.ofp_packet_out(data=event.ofp.data)
-        msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
-        event.connection.send(msg)
-
 def launch():
     pox.openflow.discovery.launch()
-    pox.openflow.spanning_tree.launch()
     core.registerNew(SDNController)
-    log.info("SDN Controller started (Robust Routing + STP)!")
+    log.info("SDN Controller started!")
