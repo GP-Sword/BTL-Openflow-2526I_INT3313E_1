@@ -10,8 +10,12 @@ class Monitor:
         self._setup_logger()
 
     def _setup_logger(self):
+        """
+        Logger configuration: Write to file, include timestamp, and overwrite on each run.
+        """
         if len(log.handlers) == 0:
-            # 1. Log to 'monitor.log'
+            # mode='w' -> Write (Overwrite old file on every POX restart)
+            # mode='a' -> Append (Default, append to old file)
             fh = logging.FileHandler('monitor.log', mode='w')
             fh.setLevel(logging.INFO)
             
@@ -25,6 +29,10 @@ class Monitor:
             log.propagate = False
 
     def _get_ip_from_mac(self, mac_addr):
+        """
+        Helper to resolve MAC to IP using the controller's ARP cache.
+        Robust comparison by converting both to lowercase strings.
+        """
         if mac_addr is None:
             return None 
         mac_str = str(mac_addr).lower()
@@ -34,6 +42,7 @@ class Monitor:
         return None
 
     def _format_bytes(self, size):
+        """Format bytes to human readable string (B, KB, MB, GB)"""
         power = 1024
         n = 0
         power_labels = {0 : 'B', 1: 'KB', 2: 'MB', 3: 'GB', 4: 'TB'}
@@ -58,6 +67,7 @@ class Monitor:
                 proto_stats['ARP'] += f.byte_count
             
             elif f.match.dl_type == ethernet.IP_TYPE:
+                # When FlowInstaller sets nw_proto, the switch returns the exact value here
                 if f.match.nw_proto == 6:
                     proto_stats['TCP'] += f.byte_count
                 elif f.match.nw_proto == 17:

@@ -71,6 +71,11 @@ class IPHandler:
         ingress_dpid = event.dpid
         egress_dpid, egress_port = self.arp.ip_port_map[dst_ip]
         
+        # Get IP Payload for Protocol Matching
+        ip_payload = None
+        if isinstance(event.parsed.payload, ipv4):
+            ip_payload = event.parsed.payload
+
         # 1. Find Path from Ingress -> Egress
         if ingress_dpid != egress_dpid:
             # Find the port on Ingress switch that leads to Egress switch
@@ -81,7 +86,9 @@ class IPHandler:
                 # This ensures Packet 2+ goes directly via hardware
                 self.flows.install_l3_flow(
                     event.connection, # Connection to Ingress Switch
-                    dst_ip, src_mac_gateway, dst_mac, link_port
+                    src_ip, dst_ip, 
+                    src_mac_gateway, dst_mac, 
+                    link_port, ip_payload
                 )
                 log.debug("Installed Ingress L3 Flow on s%s -> s%s (port %s)", 
                           ingress_dpid, egress_dpid, link_port)
@@ -90,7 +97,9 @@ class IPHandler:
         # We need this so the last switch knows to output to the Host port
         self.flows.install_l3_flow(
             core.openflow.getConnection(egress_dpid), 
-            dst_ip, src_mac_gateway, dst_mac, egress_port
+            src_ip, dst_ip, 
+            src_mac_gateway, dst_mac, 
+            egress_port, ip_payload
         )
 
         # 3. Teleport Current Packet (Packet #1)
@@ -109,9 +118,12 @@ class IPHandler:
                 src_gw_mac = self.arp.router_macs[src_gw_ip]
                 src_mac_host = self.arp.arp_cache.get(src_ip)
                 if src_mac_host:
+                    # Note: For reverse flow, we swap src/dst IP and use the same payload protocol
                     self.flows.install_l3_flow(
                         core.openflow.getConnection(src_dpid),
-                        src_ip, src_gw_mac, src_mac_host, src_port
+                        dst_ip, src_ip,  # dst becomes src for reverse flow
+                        src_gw_mac, src_mac_host, 
+                        src_port, ip_payload
                     )
 
     def process_waiting_packets(self, ip_str):
