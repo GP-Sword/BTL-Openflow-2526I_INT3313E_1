@@ -6,7 +6,6 @@ from pox.lib.recoco import Timer
 import pox.openflow.libopenflow_01 as of
 import pox.openflow.discovery
 import pox.openflow.spanning_tree
-import time
 
 from arp_handler import ARPHandler
 from ip_handler import IPHandler
@@ -94,7 +93,14 @@ class SDNController(object):
 
         if dst_mac in self.mac_to_port[dpid]:
             out_port = self.mac_to_port[dpid][dst_mac]
-            self.flow_installer.install_l2_flow(event.connection, packet.src, dst_mac, out_port)
+            
+            # Check if payload is IPv4 to pass strictly to installer
+            ip_payload = None
+            if packet.type == ethernet.IP_TYPE and isinstance(packet.payload, ipv4):
+                ip_payload = packet.payload
+            
+            self.flow_installer.install_l2_flow(event.connection, packet.src, dst_mac, out_port, ip_payload)
+            
             msg = of.ofp_packet_out(data=event.ofp.data)
             msg.actions.append(of.ofp_action_output(port=out_port))
             event.connection.send(msg)
@@ -117,4 +123,4 @@ def launch():
     pox.openflow.discovery.launch()
     pox.openflow.spanning_tree.launch() 
     core.registerNew(SDNController)
-    log.info("SDN Controller started with Spanning Tree & Strict L2 Learning!")
+    log.info("SDN Controller started!")

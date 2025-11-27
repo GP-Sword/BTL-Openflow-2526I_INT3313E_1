@@ -59,7 +59,7 @@ class IPHandler:
         else:
             if dst_ip not in self.waiting_packets:
                 self.waiting_packets[dst_ip] = []
-                self.arp.send_arp_request_from_controller(dst_ip, event)
+                self.arp.send_arp_request_from_controller(dst_ip)
             self.waiting_packets[dst_ip].append(event)
             
         return True

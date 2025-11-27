@@ -102,7 +102,7 @@ class ARPHandler:
         msg.actions.append(of.ofp_action_output(port=out_port))
         core.openflow.sendToDPID(dpid, msg)
 
-    def send_arp_request_from_controller(self, target_ip, event):
+    def send_arp_request_from_controller(self, target_ip):
         src_gw_ip = None
         for cidr, info in self.subnets.items():
             network_prefix = cidr.split('/')[0].rsplit('.', 1)[0]
