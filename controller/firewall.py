@@ -12,7 +12,7 @@ class Firewall:
             ("TCP", 80, "DENY"),   # Block HTTP
             ("UDP", 53, "ALLOW"),  # Allow DNS
         ]
-        log.info("Firewall initialized with global rules.")
+        log.info("Firewall initialized with rules: %s", self.rules)
 
     def check_firewall(self, dpid, ip_pkt):
         """

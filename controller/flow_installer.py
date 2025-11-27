@@ -36,4 +36,4 @@ class FlowInstaller:
         msg.idle_timeout = 30
         msg.hard_timeout = 60
         connection.send(msg)
-        # log.debug("Installed L3 flow for -> %s via port %s", dst_ip, out_port)
+        log.debug("Installed L3 flow for -> %s via port %s", dst_ip, out_port)

@@ -12,7 +12,6 @@ class IPHandler:
         self.arp = arp_handler
         self.flows = flow_installer
         self.fw = firewall
-        # Queue only for waiting for ARP resolution (MAC Address)
         self.waiting_packets = {} 
 
     def get_gateway(self, ip_str):
@@ -37,7 +36,6 @@ class IPHandler:
         dst_gw = self.get_gateway(dst_ip)
         
         # 2. Check Routing Necessity
-        # If gateway not found (Internet?) or same subnet -> Let L2 handle
         if not dst_gw or src_gw == dst_gw:
             return False 
 
@@ -46,8 +44,7 @@ class IPHandler:
         if dst_ip in self.arp.arp_cache and dst_ip in self.arp.ip_port_map:
             self.forward_l3_packet(event, dst_ip, dst_gw)
         else:
-            # Unknown Info -> Queue packet and send ARP Request to find it
-            # We must queue here because we can't construct the packet without Dest MAC
+            # Unknown Info -> Queue packet and send ARP Request
             if dst_ip not in self.waiting_packets:
                 self.waiting_packets[dst_ip] = []
                 self.arp.send_arp_request_from_controller(dst_ip, event)
@@ -58,61 +55,46 @@ class IPHandler:
     def forward_l3_packet(self, event, dst_ip, dst_gw_ip):
         """
         Execute Routing logic using 'Teleportation' (Direct Egress Injection).
-        This guarantees delivery even if L2 paths are not fully converged.
+        Guarantees delivery by bypassing transit L2 lookups.
         """
         dst_mac = self.arp.arp_cache[dst_ip]
         src_mac_gateway = self.arp.router_macs[dst_gw_ip]
         
-        # Get Destination Switch and Port (Where the host is connected)
+        # Get Destination Switch and Port
+        # Thanks to the fix in ARPHandler, this is now guaranteed to be the Edge Switch
         egress_dpid, egress_port = self.arp.ip_port_map[dst_ip]
         
-        # Check Firewall on the Egress Switch
         if self.fw.check_firewall(egress_dpid, event.parsed.payload) == "DENY":
             self.send_icmp_unreachable(event.parsed.payload, event.parsed, event.ofp, event)
             return
 
         # --- STEP 1: SEND PACKET (Teleportation) ---
-        # Instead of sending via the current switch (event.connection),
-        # we send the packet DIRECTLY to the Egress Switch.
-        
         msg = of.ofp_packet_out(data=event.ofp.data)
         msg.actions.append(of.ofp_action_dl_addr.set_src(src_mac_gateway))
         msg.actions.append(of.ofp_action_dl_addr.set_dst(dst_mac))
         msg.actions.append(of.ofp_action_output(port=egress_port))
         
-        # Send to specific DPID (The magic part)
+        # Send directly to the switch where the host is located
         core.openflow.sendToDPID(egress_dpid, msg)
-        # log.debug("L3: Teleported packet to egress dpid %s port %s", egress_dpid, egress_port)
 
         # --- STEP 2: INSTALL FLOW (Optimization) ---
-        # We try to install a flow on the INGRESS switch (where packet came in)
-        # so subsequent packets can travel hop-by-hop without Controller.
-        
         ingress_dpid = event.dpid
         out_port_ingress = None
         
+        # Try to install flow on the ingress switch to speed up next packets
         if ingress_dpid == egress_dpid:
-            # Host is local
             out_port_ingress = egress_port
         elif dst_mac in self.arp.mac_to_port[ingress_dpid]:
-            # Host is remote, and L2 table knows the next hop
+            # Use L2 learning to find path
             out_port_ingress = self.arp.mac_to_port[ingress_dpid][dst_mac]
         
         if out_port_ingress:
-            # We know the path, install the flow
             self.flows.install_l3_flow(event.connection, dst_ip, src_mac_gateway, dst_mac, out_port_ingress)
-        else:
-            # Path unknown (L2 table incomplete). 
-            # We do NOT install a flow yet. 
-            # The packet was already sent via Step 1, so no drop/buffer needed.
-            # Next packet will likely find the path ready.
-            pass
 
     def process_waiting_packets(self, ip_str):
         if ip_str in self.waiting_packets:
             gw = self.get_gateway(ip_str)
             for event in self.waiting_packets[ip_str]:
-                # Check mapping again
                 if ip_str in self.arp.ip_port_map:
                     self.forward_l3_packet(event, ip_str, gw)
             del self.waiting_packets[ip_str]

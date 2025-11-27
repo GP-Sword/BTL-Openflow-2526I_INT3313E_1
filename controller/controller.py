@@ -32,9 +32,7 @@ class SDNController(object):
         # Initialize ARPHandler with shared state
         self.arp_handler = ARPHandler(self.arp_cache, self.ip_port_map, self.mac_to_port)
         
-        # --- UPDATE HERE ---
-        # The new IPHandler only needs 3 arguments: arp_handler, flow_installer, firewall.
-        # It accesses arp_cache and mac_to_port via arp_handler.
+        # Initialize IPHandler
         self.ip_handler = IPHandler(self.arp_handler, self.flow_installer, self.firewall)
         
         Timer(5, self._timer_func, recurring=True)
@@ -55,17 +53,21 @@ class SDNController(object):
         # --- 2. L2 Learning (Sticky / Anti-Flapping) ---
         self.mac_to_port.setdefault(dpid, {})
         
+        is_loop_packet = False
+        
         if not packet.src.is_multicast:
             if packet.src not in self.mac_to_port[dpid]:
-                # New MAC, learn it
                 self.mac_to_port[dpid][packet.src] = in_port
-                log.debug("L2: Learned %s on dpid %s port %s", packet.src, dpid, in_port)
             elif self.mac_to_port[dpid][packet.src] != in_port:
-                # Loop detected! Ignore update.
-                pass 
+                # Loop detected! We see the same MAC on a different port.
+                # Mark as loop packet so we don't flood it again.
+                is_loop_packet = True
 
         # --- 3. Dispatch Handling ---
-        
+        # If it's a loop echo, DROP it immediately (unless it's an update we want, but for static topo, drop is safer)
+        if is_loop_packet:
+            return
+
         if packet.type == ethernet.ARP_TYPE:
             self.arp_handler.handle_arp_packet(packet, event)
             
@@ -86,28 +88,20 @@ class SDNController(object):
         dpid = event.dpid
         dst_mac = packet.dst
         
-        # Multicast/Broadcast -> Flood (handled carefully)
         if dst_mac.is_multicast:
             self._flood_packet(event)
             return 
 
-        # Unicast
         if dst_mac in self.mac_to_port[dpid]:
             out_port = self.mac_to_port[dpid][dst_mac]
-            
-            # Install Flow
             self.flow_installer.install_l2_flow(event.connection, packet.src, dst_mac, out_port)
-            
-            # Send Packet
             msg = of.ofp_packet_out(data=event.ofp.data)
             msg.actions.append(of.ofp_action_output(port=out_port))
             event.connection.send(msg)
         else:
-            # Unknown unicast destination -> Flood to find it
             self._flood_packet(event)
 
     def _flood_packet(self, event):
-        """Flood packet but DO NOT install a flood flow"""
         msg = of.ofp_packet_out(data=event.ofp.data)
         msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
         event.connection.send(msg)
