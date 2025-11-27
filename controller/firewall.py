@@ -1,49 +1,52 @@
 from pox.core import core
 from pox.lib.packet.ipv4 import ipv4
-from pox.lib.packet.ethernet import ethernet
 
 log = core.getLogger("firewall")
 
 class Firewall:
-    def __init__(self):
-        # Rule format: (direction, protocol, port, action)
-        # Direction implies ingress/egress checking logic if needed
+    def __init__(self, flow_installer):
+        self.flows = flow_installer
+        # Format: (Protocol_Name, Protocol_Code, Port, Action)
         self.rules = [
-            ("TCP", 22, "DENY"),   # Block SSH
-            ("TCP", 80, "DENY"),   # Block HTTP
-            ("UDP", 53, "ALLOW"),  # Allow DNS
+            ("SSH", ipv4.TCP_PROTOCOL, 22, "DENY"),
+            ("HTTP", ipv4.TCP_PROTOCOL, 80, "DENY"),
+            ("DNS", ipv4.UDP_PROTOCOL, 53, "ALLOW"),
         ]
-        log.info("Firewall initialized with rules: %s", self.rules)
-
-    def is_allowed(self, ip_pkt):
+    
+    def install_firewall_policies(self, connection):
         """
-        Checks L4 Firewall rules. 
-        Returns True if allowed, False if denied.
+        Install these rules as soon as switch connects (Proactive).
         """
-        # Determine protocol
-        proto = None
-        if ip_pkt.protocol == ipv4.TCP_PROTOCOL:
-            proto = "TCP"
-        elif ip_pkt.protocol == ipv4.UDP_PROTOCOL:
-            proto = "UDP"
+        log.info("Installing Firewall rules on Switch %s", connection.dpid)
         
-        # If not TCP/UDP (e.g., ICMP), allow by default
-        if proto is None:
-            return True
+        for name, proto, port, action in self.rules:
+            if action == "DENY":
+                # Install DROP Flow with High Priority (e.g., 200)
+                # Match: DL_TYPE=IP, NW_PROTO, TP_DST
+                self.flows.install_drop_flow(connection, proto, port, priority=200)
+                log.info("  Rule: Block %s (Port %s) -> Installed DROP Flow", name, port)
+            
+            elif action == "ALLOW":
+                # SDN defaults to Drop if no flow, but POX usually runs PacketIn.
+                # With ALLOW, we do nothing, letting packet pass to Routing logic (Lower Priority).
+                # Or install Forward flow with lower priority.
+                pass
 
-        # Extract destination port
-        # Helper to get transport layer payload
-        transport_pkt = ip_pkt.payload
-        dst_port = transport_pkt.dstport
-
-        # Check against rules (Priority: DENY > ALLOW)
-        for rule_proto, rule_port, rule_action in self.rules:
-            if rule_proto == proto and rule_port == dst_port:
+    def check_firewall_packet(self, ip_pkt):
+        """
+        Redundant check for first packets to controller (before flow takes effect)
+        """
+        proto = ip_pkt.protocol
+        dst_port = None
+        
+        if proto == ipv4.TCP_PROTOCOL or proto == ipv4.UDP_PROTOCOL:
+            try: dst_port = ip_pkt.payload.dstport
+            except: return "ALLOW"
+        
+        for name, rule_proto, rule_port, rule_action in self.rules:
+            if proto == rule_proto and dst_port == rule_port:
                 if rule_action == "DENY":
-                    log.info("BLOCKED %s packet to port %s", proto, dst_port)
-                    return False
-                elif rule_action == "ALLOW":
-                    return True
+                    log.info("FIREWALL: Software Blocked %s packet port %s", name, dst_port)
+                    return "DENY"
         
-        # Default policy: ALLOW
-        return True
+        return "ALLOW"
