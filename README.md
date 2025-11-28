@@ -1,160 +1,110 @@
-# Báo cáo BTL Openflow: Hệ thống Router SDN Hoàn Chỉnh
+# LAB CUỐI KỲ – XÂY DỰNG SDN GATEWAY HOÀN CHỈNH (ROUTER + FIREWALL + MONITORING)
 
-## 1. Giới thiệu
 
-Báo cáo này trình bày thiết kế và cài đặt một hệ thống SDN Router sử dụng POX controller và Mininet. Hệ thống đáp ứng đầy đủ các yêu cầu: chuyển mạch L2, định tuyến L3 giữa 3 subnet, xử lý ARP, Firewall L4, cài đặt Flow để tối ưu hiệu năng và giám sát lưu lượng mạng. Đặc biệt, hệ thống xử lý topo mạng có vòng lặp (loop) thông qua Spanning Tree Protocol.
+## 1. Topology mạng
 
-## 2. Kiến trúc Hệ thống
+  Subnet A            Subnet B               Subnet C
+ h1,h2 ---- s1 ---- s2 ---- h3,h4 ---- s3 ---- h5,h6
+         \_______ liên kết giữa s1—s2—s3 ______/
 
-### 2.1. Topology
+s1, s2, s3 là OpenFlow switch đóng vai router
 
-Hệ thống mạng được xây dựng trên Mininet với cấu trúc hình tam giác (Ring Topology):
+- Mỗi subnet bắt buộc có ít nhất 2 host
 
-- **3 Switches (s1, s2, s3):** Kết nối vòng tròn (s1-s2, s2-s3, s3-s1).
+- Mỗi switch phải được gán IP gateway:
 
-- **3 Subnet:**
+  - s1 → 10.0.1.1
 
-  + Subnet A (10.0.1.0/24) -> s1 (Gateway 10.0.1.1)
+  - s2 → 10.0.2.1
 
-  + Subnet B (10.0.2.0/24) -> s2 (Gateway 10.0.2.1)
+  - s3 → 10.0.3.1
 
-  + Subnet C (10.0.3.0/24) -> s3 (Gateway 10.0.3.1)
 
-- **Hosts:** Mỗi subnet có 2 host giả lập.
+## 2. Yêu cầu 1 – ARP Handler
+Viết hàm xử lý ARP:
 
-- **Controller:** POX Controller chạy tập trung. Do topo có vòng lặp vật lý, module **Spanning Tree Protocol (STP)** được kích hoạt để khóa logic một cổng, ngăn chặn Broadcast Storm.
+- Trả lời ARP request cho gateway của router
 
-### 2.2. Các Module Controller
+- Gửi ARP request khi MAC chưa có trong ARP cache
 
-Mã nguồn được tổ chức thành 6 file riêng biệt để dễ quản lý:
+- Lưu ARP cache
 
-- `controller.py`: Chương trình chính, khởi tạo STP, Discovery và các module con.
+- Tạo hàng đợi (queue) packet chờ ARP reply
 
-- `arp_handler.py`: Xử lý toàn bộ logic liên quan đến ARP (ARP Proxy cho Gateway và ARP Client cho Host).
+## 3. Yêu cầu 2 – IP Packet Handler (Routing)
 
-- `firewall.py`: Chứa bảng luật ACL và logic kiểm tra gói tin.
+Sinh viên phải triển khai đầy đủ logic định tuyến giữa 3 subnet:
 
-- `ip_handler.py`: "Bộ não" định tuyến, quyết định đường đi của gói tin IP.
+Khi nhận gói IPv4:
 
-- `flow_installer.py`: Chịu trách nhiệm đẩy rule xuống switch (Data Plane).
+&nbsp;&nbsp;&nbsp; 1\. Parse Ethernet + IPv4 + ICMP/TCP
 
-- `monitor.py`: Thu thập số liệu thống kê từ switch.
+&nbsp;&nbsp;&nbsp; 2\. Kiểm tra routing table
 
-## 3. Chi tiết Logic Hoạt động
+&nbsp;&nbsp;&nbsp; 3\. Tính next-hop
 
-Phần này mô tả chi tiết cách code xử lý từng loại gói tin và các cơ chế bên trong.
+&nbsp;&nbsp;&nbsp; 4\. Rewrite MAC (src = MAC router, dst = MAC next-hop)
 
-### 3.1. Module Firewall (Tầng 4)
+&nbsp;&nbsp;&nbsp; 5\. Gửi packet_out qua đúng port
 
-Firewall hoạt động ở chế độ **"Default Allow"** (Cho phép tất cả trừ khi bị chặn). Module này được gọi đầu tiên khi có gói tin IP đi vào.
+Sinh viên phải chứng minh router định tuyến được giữa tất cả 3 subnet.
 
-**Cấu trúc ACL (Access Control List):** Code sử dụng một danh sách các tuples để định nghĩa luật:
+## 4. Yêu cầu 3 – Flow Installation (Tối ưu hiệu năng)
 
+Sau khi xử lý packet đầu tiên, phải cài đặt flow_mod lên switch:
+
+- match: dl_type, nw_dst, nw_proto, …
+
+- actions: set_dl_src, set_dl_dst, output
+
+- reverse flow (chiều ngược lại) cũng phải được thiết lập
+
+
+## 5. Yêu cầu 4 – Firewall tầng 4 (TCP/UDP)
+
+Sinh viên phải xây dựng một ACL như ví dụ:
 ```
-# Format: (Giao thức, Port, Hành động)
-self.rules = [
-    ("TCP", 22, "DENY"),   # Rule 1: Chặn SSH (Port 22)
-    ("TCP", 80, "DENY"),   # Rule 2: Chặn Web/HTTP (Port 80)
-    ("UDP", 53, "ALLOW"),  # Rule 3: Cho phép DNS (Port 53)
+RULES = [
+   ("INBOUND",  "TCP", 22, "DENY"),   # Chặn SSH vào subnet
+   ("INBOUND",  "TCP", 80, "DENY"),   # Chặn HTTP
+   ("OUTBOUND", "UDP", 53, "ALLOW"),  # Cho phép DNS
 ]
 ```
 
-**Logic xử lý** **(** `is_allowed` **function):**
+- So khớp giao thức: TCP (6), UDP (17)
 
-1\. Parse header IP để lấy Protocol (TCP=6, UDP=17).
+- So khớp port: tp_dst
 
-2\. Parse header Transport (TCP/UDP) để lấy `dst_port`.
+- So khớp chiều: in_port
 
-3\. Duyệt qua danh sách `self.rules`:
+- Flow DROP phải có priority cao
 
-- Nếu khớp Protocol VÀ khớp Port:
+- Flow ALLOW có priority thấp hơn
 
-  - Nếu Action là "DENY" -> Trả về `False` (Drop gói ngay lập tức).
+ 
+## 6. Yêu cầu 5 – Monitoring (giám sát lưu lượng)
 
-  - Nếu Action là "ALLOW" -> Trả về `True` (Cho phép đi tiếp).
+Sinh viên phải cài đặt module thu thập thống kê:
 
-4\. Nếu duyệt hết danh sách mà không khớp rule nào -> Trả về `True`.
+- Thống kê theo host: số byte gửi/nhận
 
-### 3.2. Module ARP Handler
+- Thống kê theo giao thức: TCP/UDP/ICMP
 
-Module này giải quyết vấn đề ánh xạ địa chỉ IP <-> MAC:
+- Sử dụng ofp_stats_request
 
-- **Xử lý ARP Request tới Gateway**:
+- Cập nhật 5 giây/lần
 
-  - Khi Host gửi ARP Request hỏi `Who has 10.0.x.1?` (Gateway ảo).
+## 7. Các tài liệu cần phải nộp
 
-  - Controller nhận gói tin, kiểm tra IP đích.
+### 7.1. Mã nguồn controller
 
-  - Tự tạo gói ARP Reply với `hw_src` là MAC ảo của Router (ví dụ: `00:00:00:00:01:01`) và gửi lại cho Host.
+`arp_handler.py`
+`ip_handler.py`
+`firewall.py`
+`flow_installer.py`
+`monitor.py`
+`controller.py`
 
-  - *Mục đích*: Giúp Host tin rằng Gateway là một thiết bị thực.
+### 7.2. File topo
 
-- **Cơ chế "ARP Hold-Down" (Hàng đợi):**
-
-  - Khi Router cần chuyển gói tin IP tới Host đích nhưng chưa biết MAC đích.
-
-  - Router **không drop gói tin** mà lưu vào hàng đợi `waiting_packets[dest_ip]`.
-
-  - Router gửi ARP Request (Broadcast) hỏi `Who has [dest_ip]`?.
-
-  - Khi nhận được ARP Reply từ Host đích -> Module kích hoạt hàm `process_waiting_packets` để lấy các gói tin trong hàng đợi ra và gửi đi.
-
-### 3.3. Module IP Handler (Routing Logic)
-
-Đây là logic cốt lõi mô phỏng hoạt động của Router L3:
-
-1\. **Kiểm tra điểm đến**:
-
-- Nếu IP đích là Gateway (ví dụ ping 10.0.1.1) -> Chuyển sang xử lý ICMP Reply (Ping).
-
-- Nếu IP đích thuộc subnet khác -> Thực hiện định tuyến.
-
-2\. **Quy trình Forwarding:**
-
-- **B1: Lookup Route:** Xác định Gateway của subnet đích (trong bài lab này logic đơn giản hóa bằng cách check prefix IP).
-
-- **B2: Resolve MAC:** Tra bảng ARP Cache để tìm MAC của Host đích.
-
-- **B3: Rewrite Header** (Quan trọng): Để gói tin đi qua được router, header Ethernet phải được viết lại:
-
-  - `eth.src` = MAC của Router (Interface đầu ra).
-
-  - `eth.dst` = MAC của Host đích (Next Hop).
-
-- **B4: Output:** Đẩy gói tin ra port nối với Host đích (dựa trên bảng L2 Learning mac_to_port).
-
-### 3.4. Module Flow Installation (Tối ưu Data Plane)
-
-Để tránh việc Controller phải xử lý từng gói tin (gây quá tải), sau khi gói tin đầu tiên được định tuyến thành công, module này sẽ cài đặt một "luật cứng" xuống Switch.
-
-- **Nội dung Flow Mod:**
-
-  - **Match:** Khớp chính xác IP đích (`nw_dst`), loại gói tin IP.
-
-  - **Action:**
-
-    - `set_dl_src`: Ghi đè MAC nguồn thành MAC Router.
-
-    - `set_dl_dst`: Ghi đè MAC đích thành MAC Host nhận.
-
-    - `output`: Đẩy ra port tương ứng.
-
-  - **Timeout:** `idle_timeout=30s` (Tự xóa nếu không có lưu lượng).
-
-- **Hiệu quả:** Các gói tin thứ 2, 3... sẽ được Switch xử lý trực tiếp ở tốc độ phần cứng (Wire speed) mà không cần gửi lên Controller (`PacketIn`).
-
-### 3.5. Module Monitoring
-
-- Sử dụng `Timer` lặp lại mỗi 5 giây.
-
-- Gửi bản tin `ofp_stats_request` yêu cầu Switch báo cáo số liệu.
-
-- Khi nhận `ofp_stats_reply`, code sẽ phân tích:
-
-    - Cộng dồn `byte_count` của các flow có `nw_proto=6` vào biến đếm TCP.
-
-    - Cộng dồn `byte_count` của các flow có `nw_proto=17` vào biến đếm UDP.
-
-    - Thống kê lưu lượng theo từng địa chỉ IP nguồn (`nw_src`).
-
-- Kết quả được in ra log console thời gian thực.
+`multi_router_topo.py`
