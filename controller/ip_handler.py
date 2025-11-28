@@ -3,6 +3,7 @@ from pox.lib.packet.ethernet import ethernet
 from pox.lib.packet.ipv4 import ipv4
 from pox.lib.packet.icmp import icmp
 import pox.openflow.libopenflow_01 as of
+import collections
 
 log = core.getLogger("ip_handler")
 
@@ -13,6 +14,7 @@ class IPHandler:
         self.fw = firewall
         self.subnets = subnets
         self.waiting_packets = {} 
+        self.discovery = core.openflow_discovery
 
     def get_gateway_ip(self, ip_str):
         for cidr, info in self.subnets.items():
@@ -21,14 +23,50 @@ class IPHandler:
                 return info['gw_ip']
         return None
 
-    def _get_inter_switch_link(self, src_dpid, dst_dpid):
+    def _get_path_bfs(self, src_dpid, dst_dpid):
         """
-        Find the output port on src_dpid that leads to dst_dpid
-        using POX Discovery module (Adjacency list).
+        Finds shortest path between switches using BFS.
+        Treats links as Bidirectional (Undirected Graph) to handle async discovery.
+        Returns list of DPIDs: [src, ..., dst]
         """
-        for link in core.openflow_discovery.adjacency:
-            if link.dpid1 == src_dpid and link.dpid2 == dst_dpid:
+        if src_dpid == dst_dpid: return [src_dpid]
+        
+        # Build adjacency graph
+        adj = collections.defaultdict(set)
+        for link in self.discovery.adjacency:
+            # Add edge A -> B
+            adj[link.dpid1].add(link.dpid2)
+            # Add edge B -> A 
+            adj[link.dpid2].add(link.dpid1)
+            
+        # BFS
+        queue = collections.deque([[src_dpid]])
+        visited = set([src_dpid])
+        
+        while queue:
+            path = queue.popleft()
+            node = path[-1]
+            if node == dst_dpid: return path
+            for neighbor in adj[node]:
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    new_path = list(path)
+                    new_path.append(neighbor)
+                    queue.append(new_path)
+        return None
+
+    def _get_port_to_next_hop(self, src_dpid, next_dpid):
+        """
+        Returns the port on src_dpid that connects to next_dpid.
+        Checks both link directions in discovery.
+        """
+        for link in self.discovery.adjacency:
+            # Case 1: Discovery found Src -> Next
+            if link.dpid1 == src_dpid and link.dpid2 == next_dpid:
                 return link.port1
+            # Case 2: Discovery found Next -> Src (Infer Src -> Next)
+            if link.dpid1 == next_dpid and link.dpid2 == src_dpid:
+                return link.port2
         return None
 
     def handle_ip_packet(self, event):
@@ -37,7 +75,7 @@ class IPHandler:
         src_ip = str(ip_pkt.srcip)
         dst_ip = str(ip_pkt.dstip)
         
-        # 1. Packet to Router (Ping Gateway)
+        # 1. Handle Ping to Gateway
         if dst_ip in self.arp.router_macs:
             if ip_pkt.protocol == ipv4.ICMP_PROTOCOL and ip_pkt.payload.type == 8:
                 self.send_icmp_reply(event, ip_pkt)
@@ -46,17 +84,15 @@ class IPHandler:
         src_gw = self.get_gateway_ip(src_ip)
         dst_gw = self.get_gateway_ip(dst_ip)
         
-        # 2. Check Routing Necessity 
+        # 2. Skip if destination is unknown or same subnet (L2 handles same subnet)
         if not dst_gw: return False 
-        
-        # If same Gateway (Same Subnet), Return False to let L2 Switching handle it
-        if src_gw == dst_gw:
-            return False
+        if src_gw == dst_gw: return False
 
-        # 3. L3 Routing
+        # 3. L3 Routing Logic
         if dst_ip in self.arp.arp_cache and dst_ip in self.arp.ip_port_map:
-            self.forward_l3_packet(event, src_ip, dst_ip, dst_gw)
+            self.install_end_to_end_routing(event, src_ip, dst_ip, dst_gw)
         else:
+            # Queue packet and ARP for destination
             if dst_ip not in self.waiting_packets:
                 self.waiting_packets[dst_ip] = []
                 self.arp.send_arp_request_from_controller(dst_ip)
@@ -64,67 +100,71 @@ class IPHandler:
             
         return True
 
-    def forward_l3_packet(self, event, src_ip, dst_ip, dst_gw_ip):
-        dst_mac = self.arp.arp_cache[dst_ip]
-        src_mac_gateway = self.arp.router_macs[dst_gw_ip]
-        
+    def install_end_to_end_routing(self, event, src_ip, dst_ip, dst_gw_ip):
+        """Installs flows for both Forward and Reverse paths across all switches."""
         ingress_dpid = event.dpid
         egress_dpid, egress_port = self.arp.ip_port_map[dst_ip]
         
-        # Get IP Payload for Protocol Matching
-        ip_payload = None
-        if isinstance(event.parsed.payload, ipv4):
-            ip_payload = event.parsed.payload
+        dst_mac = self.arp.arp_cache[dst_ip]
+        dst_gw_mac = self.arp.router_macs[dst_gw_ip]
 
-        # 1. Find Path from Ingress -> Egress
-        if ingress_dpid != egress_dpid:
-            # Find the port on Ingress switch that leads to Egress switch
-            link_port = self._get_inter_switch_link(ingress_dpid, egress_dpid)
+        # --- A. Forward Path Installation (Src -> Dst) ---
+        path = self._get_path_bfs(ingress_dpid, egress_dpid)
+        
+        if path:
+            log.info("Installing Path %s: %s -> %s", path, src_ip, dst_ip)
             
-            if link_port:
-                # Install L3 Flow on Ingress Switch: Rewrite MACs + Send to Next Hop Switch
-                # This ensures Packet 2+ goes directly via hardware
-                self.flows.install_l3_flow(
-                    event.connection, # Connection to Ingress Switch
-                    src_ip, dst_ip, 
-                    src_mac_gateway, dst_mac, 
-                    link_port, ip_payload
-                )
-                log.debug("Installed Ingress L3 Flow on s%s -> s%s (port %s)", 
-                          ingress_dpid, egress_dpid, link_port)
-
-        # 2. Install Flow on Egress Switch (Last Hop)
-        # We need this so the last switch knows to output to the Host port
-        self.flows.install_l3_flow(
-            core.openflow.getConnection(egress_dpid), 
-            src_ip, dst_ip, 
-            src_mac_gateway, dst_mac, 
-            egress_port, ip_payload
-        )
-
-        # 3. Teleport Current Packet (Packet #1)
-        # We still teleport packet #1 to ensure lowest latency for the very first packet
-        msg = of.ofp_packet_out(data=event.ofp.data)
-        msg.actions.append(of.ofp_action_dl_addr.set_src(src_mac_gateway))
-        msg.actions.append(of.ofp_action_dl_addr.set_dst(dst_mac))
-        msg.actions.append(of.ofp_action_output(port=egress_port))
-        core.openflow.sendToDPID(egress_dpid, msg)
-
-        # 4. Reverse Flow (Optimization for Reply)
-        if src_ip in self.arp.ip_port_map:
-            src_dpid, src_port = self.arp.ip_port_map[src_ip]
-            src_gw_ip = self.get_gateway_ip(src_ip)
-            if src_gw_ip:
-                src_gw_mac = self.arp.router_macs[src_gw_ip]
-                src_mac_host = self.arp.arp_cache.get(src_ip)
-                if src_mac_host:
-                    # Note: For reverse flow, we swap src/dst IP and use the same payload protocol
+            for i, dpid in enumerate(path):
+                # Determine output port
+                if dpid == egress_dpid:
+                    out_port = egress_port # Last hop: output to host
+                else:
+                    out_port = self._get_port_to_next_hop(dpid, path[i+1]) # Middle hop: output to next switch
+                
+                if out_port:
                     self.flows.install_l3_flow(
-                        core.openflow.getConnection(src_dpid),
-                        dst_ip, src_ip,  # dst becomes src for reverse flow
-                        src_gw_mac, src_mac_host, 
-                        src_port, ip_payload
+                        core.openflow.getConnection(dpid),
+                        src_ip, dst_ip,
+                        dst_gw_mac, dst_mac, # Rewrite MACs to look like Router->Host
+                        out_port, event.parsed.payload
                     )
+
+            # Send the first packet directly to Egress to minimize latency
+            msg = of.ofp_packet_out(data=event.ofp.data)
+            msg.actions.append(of.ofp_action_dl_addr.set_src(dst_gw_mac))
+            msg.actions.append(of.ofp_action_dl_addr.set_dst(dst_mac))
+            msg.actions.append(of.ofp_action_output(port=egress_port))
+            core.openflow.sendToDPID(egress_dpid, msg)
+        else:
+            log.warning("No Path found from %s to %s. Discovery might be incomplete.", ingress_dpid, egress_dpid)
+
+        # --- B. Reverse Path Installation (Dst -> Src) ---
+        # Only if we know the Source Host info (to rewrite MACs correctly)
+        if src_ip in self.arp.arp_cache and src_ip in self.arp.ip_port_map:
+            src_mac = self.arp.arp_cache[src_ip]
+            src_gw_ip = self.get_gateway_ip(src_ip)
+            src_gw_mac = self.arp.router_macs[src_gw_ip]
+            src_egress_dpid, src_egress_port = self.arp.ip_port_map[src_ip]
+
+            # Reverse path is just the forward path reversed
+            rev_path = path[::-1] if path else self._get_path_bfs(egress_dpid, src_egress_dpid)
+            
+            if rev_path:
+                log.info("Installing Reverse Path %s: %s -> %s", rev_path, dst_ip, src_ip)
+                for i, dpid in enumerate(rev_path):
+                    if dpid == src_egress_dpid:
+                        out_port = src_egress_port
+                    else:
+                        out_port = self._get_port_to_next_hop(dpid, rev_path[i+1])
+                    
+                    if out_port:
+                        # Note: Swap src/dst IPs for reverse flow
+                        self.flows.install_l3_flow(
+                            core.openflow.getConnection(dpid),
+                            dst_ip, src_ip,
+                            src_gw_mac, src_mac,
+                            out_port, event.parsed.payload
+                        )
 
     def process_waiting_packets(self, ip_str):
         if ip_str in self.waiting_packets:
@@ -133,7 +173,7 @@ class IPHandler:
                 packet = event.parsed
                 src_ip = str(packet.payload.srcip)
                 if ip_str in self.arp.ip_port_map:
-                    self.forward_l3_packet(event, src_ip, ip_str, gw)
+                    self.install_end_to_end_routing(event, src_ip, ip_str, gw)
             del self.waiting_packets[ip_str]
 
     def send_icmp_reply(self, event, ip_pkt):

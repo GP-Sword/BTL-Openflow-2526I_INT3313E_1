@@ -34,6 +34,6 @@ class MultiRouterTopo(Topo):
         # Link Switches (Triangle/Ring Topology)
         self.addLink(s1, s2)
         self.addLink(s2, s3)
-        self.addLink(s1, s3)
+        # self.addLink(s1, s3)
 
 topos = {'multirouter': (lambda: MultiRouterTopo())}
