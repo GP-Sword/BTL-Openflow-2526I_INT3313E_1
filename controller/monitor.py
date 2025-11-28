@@ -1,38 +1,34 @@
 from pox.core import core
 from pox.lib.packet.ethernet import ethernet
 import logging
+import datetime
 
 log = core.getLogger("monitor")
 
 class Monitor:
     def __init__(self, arp_cache):
         self.arp_cache = arp_cache
+        self.stats_buffer = {}
         self._setup_logger()
 
     def _setup_logger(self):
         """
-        Logger configuration: Write to file, include timestamp, and overwrite on each run.
+        Logger configuration: Write to file, overwrite on each run.
+        Format: Only message content (Time is handled manually).
         """
         if len(log.handlers) == 0:
             # mode='w' -> Write (Overwrite old file on every POX restart)
-            # mode='a' -> Append (Default, append to old file)
             fh = logging.FileHandler('monitor.log', mode='w')
             fh.setLevel(logging.INFO)
             
-            # 2. Format: [Hour : Minute : Second] Content
-            formatter = logging.Formatter('[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
+            # Use simple message formatting
+            formatter = logging.Formatter('%(message)s')
             fh.setFormatter(formatter)
             
             log.addHandler(fh)
-            
-            # 3. Disable propagation to prevent flooding POX terminal
             log.propagate = False
 
     def _get_ip_from_mac(self, mac_addr):
-        """
-        Helper to resolve MAC to IP using the controller's ARP cache.
-        Robust comparison by converting both to lowercase strings.
-        """
         if mac_addr is None:
             return None 
         mac_str = str(mac_addr).lower()
@@ -42,7 +38,6 @@ class Monitor:
         return None
 
     def _format_bytes(self, size):
-        """Format bytes to human readable string (B, KB, MB, GB)"""
         power = 1024
         n = 0
         power_labels = {0 : 'B', 1: 'KB', 2: 'MB', 3: 'GB', 4: 'TB'}
@@ -53,21 +48,19 @@ class Monitor:
 
     def handle_flow_stats(self, event):
         dpid = event.connection.dpid
-        host_stats = {} 
         
+        # --- 1. Process Data ---
+        host_stats = {} 
         proto_stats = {
             'TCP': 0, 'UDP': 0, 'ICMP': 0, 'ARP': 0,
-            'IP_Aggr': 0, 
-            'Ctrl': 0     
+            'IP_Aggr': 0, 'Ctrl': 0     
         }
 
         for f in event.stats:
-            # --- 1. Classify by Protocol ---
+            # Protocol Classification
             if f.match.dl_type == ethernet.ARP_TYPE:
                 proto_stats['ARP'] += f.byte_count
-            
             elif f.match.dl_type == ethernet.IP_TYPE:
-                # When FlowInstaller sets nw_proto, the switch returns the exact value here
                 if f.match.nw_proto == 6:
                     proto_stats['TCP'] += f.byte_count
                 elif f.match.nw_proto == 17:
@@ -79,55 +72,69 @@ class Monitor:
             else:
                 proto_stats['Ctrl'] += f.byte_count
             
-            # --- 2. Stats by Host ---
-            src_ip = None
-            if f.match.nw_src:
-                src_ip = str(f.match.nw_src)
-            elif f.match.dl_src: 
-                src_ip = self._get_ip_from_mac(f.match.dl_src)
-            
+            # Host Statistics
+            src_ip = str(f.match.nw_src) if f.match.nw_src else self._get_ip_from_mac(f.match.dl_src)
             if src_ip:
                 if src_ip not in host_stats: host_stats[src_ip] = {'tx': 0, 'rx': 0}
                 host_stats[src_ip]['tx'] += f.byte_count
             
-            dst_ip = None
-            if f.match.nw_dst:
-                dst_ip = str(f.match.nw_dst)
-            elif f.match.dl_dst:
-                dst_ip = self._get_ip_from_mac(f.match.dl_dst)
-
+            dst_ip = str(f.match.nw_dst) if f.match.nw_dst else self._get_ip_from_mac(f.match.dl_dst)
             if dst_ip:
                 if dst_ip not in host_stats: host_stats[dst_ip] = {'tx': 0, 'rx': 0}
                 host_stats[dst_ip]['rx'] += f.byte_count
 
-        # --- 3. Display Log (To File Only) ---
-        total_bytes = sum(proto_stats.values())
-        if total_bytes > 0:
-            log.info(" ")
-            log.info("========== TRAFFIC STATS [Switch %s] ==========", dpid)
-            
-            log_parts = []
-            if proto_stats['TCP'] > 0: log_parts.append("TCP:%s" % self._format_bytes(proto_stats['TCP']))
-            if proto_stats['UDP'] > 0: log_parts.append("UDP:%s" % self._format_bytes(proto_stats['UDP']))
-            if proto_stats['ICMP'] > 0: log_parts.append("ICMP:%s" % self._format_bytes(proto_stats['ICMP']))
-            if proto_stats['ARP'] > 0: log_parts.append("ARP:%s" % self._format_bytes(proto_stats['ARP']))
-            if proto_stats['IP_Aggr'] > 0: log_parts.append("IP(Aggr):%s" % self._format_bytes(proto_stats['IP_Aggr']))
-            if proto_stats['Ctrl'] > 0: log_parts.append("Ctrl:%s" % self._format_bytes(proto_stats['Ctrl']))
-            
-            if not log_parts: log_parts.append("No Data")
+        # --- 2. Format Output for this Switch ---
+        lines = []
+        
+        header_str = " [ Switch %s ] " % dpid
+        lines.append(header_str.center(77, "="))
+        
+        # Protocol Line
+        log_parts = []
+        display_order = ['TCP', 'UDP', 'ICMP', 'ARP', 'IP_Aggr', 'Ctrl']
+        for p in display_order:
+            val = proto_stats.get(p, 0)
+            val_str = self._format_bytes(val) if val > 0 else "X"
+            log_parts.append("%s:%s" % (p, val_str))
+        lines.append("   [Proto] " + " | ".join(log_parts))
 
-            log.info("   [Proto] " + " | ".join(log_parts))
-            
-            active_hosts = {k: v for k, v in host_stats.items() if v['tx'] > 0 or v['rx'] > 0}
+        # Host Activity
+        lines.append("   [Host Activity]")
+        
+        active_hosts = {k: v for k, v in host_stats.items() if v['tx'] > 0 or v['rx'] > 0}
+        if not active_hosts:
+            lines.append("          --- No activities at this moment ---")
+        else:
             sorted_hosts = sorted(active_hosts.items(), 
                                   key=lambda item: item[1]['tx'] + item[1]['rx'], 
                                   reverse=True)
-            
-            if sorted_hosts:
-                log.info("   [Host Activity]    ")
-                for host, stats in sorted_hosts[:5]:
-                    log.info("     Host %-15s | TX: %-10s | RX: %-10s", 
+            for host, stats in sorted_hosts[:5]: # Top 5
+                lines.append("     Host %-15s | TX: %-12s | RX: %-12s" % (
                              host, 
                              self._format_bytes(stats['tx']), 
-                             self._format_bytes(stats['rx']))
-            log.info("=====================================================")
+                             self._format_bytes(stats['rx'])))
+        
+        lines.append(" ") # Empty line for spacing between switches
+
+        self.stats_buffer[dpid] = "\n".join(lines)
+
+        # --- 3. Check Condition to Flush Log ---
+        connected_count = len(core.openflow.connections)
+        
+        if len(self.stats_buffer) >= connected_count:
+            self._flush_log()
+
+    def _flush_log(self):
+        """Write the buffered stats to log file in one go"""
+        log.info(" ")
+        log.info("========================= NETWORK TRAFFIC STATISTIC =========================")
+        log.info("Timestamp: %s", datetime.datetime.now().strftime('%H:%M:%S'))
+        
+        # Print switches in order (1, 2, 3...)
+        for dpid in sorted(self.stats_buffer.keys()):
+            log.info(self.stats_buffer[dpid])
+        
+        log.info("============================= END OF STATISTIC ==============================")
+        
+        # Clear buffer for next cycle
+        self.stats_buffer.clear()
